@@ -19,7 +19,7 @@ namespace tcp_server {
 
             while (true) {
                 WaitForNextClient(out Guid id, out TcpClient client, out NetworkStream stream);
-                ReadMessage(id, client, stream);
+                ReadMessageAsync(id, client, stream); //dont await
             }
         }
 
@@ -31,7 +31,7 @@ namespace tcp_server {
             Print($"New client!\t{id}\tTotal: {clients.Count}");
         }
 
-        async static void ReadMessage(Guid id, TcpClient client, NetworkStream stream) {
+        async static void ReadMessageAsync(Guid id, TcpClient client, NetworkStream stream) {
             StringBuilder messageBuilder = new StringBuilder();
             byte[] receivedBuffor = new byte[bufferSize];
             short sizeFromMessageHeader = 0;
