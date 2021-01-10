@@ -4,52 +4,35 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
-using System.Threading;
 using System.Threading.Tasks;
 
 namespace tcp_server {
-    class Program {
-        static readonly short port = 2121;
-        static readonly byte bufferSize = 64; //not lower than 5! first 5 bytes shows whole message size
+    class ClientProxy {
+        readonly EventHandler<string> printHandler;
+        readonly EventHandler<ClientProxy> dcHandler;
 
-        static readonly TcpListener server = new TcpListener(IPAddress.Loopback, port);
-        static readonly Dictionary<Guid, dynamic> clients = new Dictionary<Guid, dynamic>();
+        readonly byte[] receivedBuffor = new byte[64]; //not lower than 5! first 5 bytes shows whole message size
+        readonly StringBuilder messageBuilder = new StringBuilder();
+        int currentPartSize;
+        short sizeFromMessageHeader;
+        int alreadyReadBytes;
 
-        static void Main(string[] args) {
-            server.Start();
-            Print($"Hello world! Waiting for new clients on TCP port {port}...");
-
-            Console.CancelKeyPress += (o, e) => {
-                Console.WriteLine("Exititing...");
-                foreach (KeyValuePair<Guid, dynamic> entry in clients) {
-                    entry.Value.stream.Close();
-                    entry.Value.client.Close();
-                }
-                Environment.Exit(0);
-            };
-
-            while (true) {
-                WaitForNextClient(out Guid id, out TcpClient client, out NetworkStream stream);
-                ReadMessageAsync(id, client, stream); //dont await -> create new background thread 
-            }
+        public ClientProxy(TcpClient client, EventHandler<string> printHandler,
+            EventHandler<ClientProxy> dcHandler) {
+            Client = client;
+            this.printHandler = printHandler;
+            this.dcHandler = dcHandler;
+            Stream = Client.GetStream();
         }
 
-        static void WaitForNextClient(out Guid id, out TcpClient client, out NetworkStream stream) {
-            client = server.AcceptTcpClient();
-            stream = client.GetStream();
-            id = Guid.NewGuid();
-            clients.Add(id, new { client, stream });
-            Print($"New client!\t{id}\tTotal: {clients.Count}");
-        }
+        public TcpClient Client { get; }
+        public Guid Id { get; } = Guid.NewGuid();
+        public string ShortId => Id.ToString().Substring(0, 8);
+        public NetworkStream Stream { get; }
 
-        async static Task ReadMessageAsync(Guid id, TcpClient client, NetworkStream stream) {
-            StringBuilder messageBuilder = new StringBuilder();
-            byte[] receivedBuffor = new byte[bufferSize];
-            short sizeFromMessageHeader = 0;
-            int alreadyReadBytes = 0;
+        public void KeepListening() {
             try {
-                int currentPartSize;
-                while ((currentPartSize = await stream.ReadAsync(receivedBuffor, 0, receivedBuffor.Length)) != 0) {
+                while ((currentPartSize = Stream.Read(receivedBuffor, 0, receivedBuffor.Length)) != 0) {
                     string decoded = Encoding.ASCII.GetString(receivedBuffor, 0, currentPartSize);
                     messageBuilder.Append(decoded);
 
@@ -59,31 +42,88 @@ namespace tcp_server {
 
                     alreadyReadBytes += currentPartSize;
                     if (alreadyReadBytes == sizeFromMessageHeader) { //last part
-                        Print($"<<< Received\t{ShortId(id)}:\t\"{messageBuilder}\".");
-                        string response = $"Read {alreadyReadBytes} bytes long message.";
-                        byte[] encoded = Encoding.ASCII.GetBytes(response);
-                        await stream.WriteAsync(encoded, 0, encoded.Length);
-                        Print($">>> Sent\t{ShortId(id)}:\t\"{response}\".");
-
+                        printHandler.Invoke(this, $"{messageBuilder.ToString()[6..]}");
                         messageBuilder.Clear();
                         sizeFromMessageHeader = 0;
                         alreadyReadBytes = 0;
                     }
                 }
             } catch (IOException) { //client force closed while connection was active
-                stream.Close();
-                client.Close();
-                clients.Remove(id);
-                Print($"Disconnected.\t{id}\tTotal: {clients.Count}");
+                Stream.Close();
+                Client.Close();
+                dcHandler.Invoke(this, null);
             }
         }
 
-        static string ShortId(Guid id) {
-            return $"{id.ToString().Substring(0, 8)}...";
+        public async Task SendAsync(string msg) {
+            try {
+                byte[] encoded = Encoding.ASCII.GetBytes(msg);
+                Stream.WriteAsync(encoded, 0, encoded.Length);
+            } catch (IOException) { //client force closed while connection was active
+                Stream.Close();
+                Client.Close();
+                dcHandler.Invoke(this, null);
+            }
+        }
+    }
+
+    class Program {
+        //static readonly IPAddress host = IPAddress.Parse("127.0.0.1");
+        static readonly short port = 2121;
+        static readonly TcpListener server = new TcpListener(port);
+        static readonly HashSet<ClientProxy> clients = new HashSet<ClientProxy>();
+
+        static void Main(string[] args) {
+            server.Start();
+            Print($"Waiting for new clients on TCP port {port}...");
+
+            //reading messages from each client
+            Task.Run(() => {
+                while (true) {
+                    ClientProxy client = WaitForNextClient();
+                    Task.Run(() => {
+                        client.KeepListening();
+                    });
+                }
+            });
+
+            Console.ReadKey();
         }
 
-        static void Print(string msg) {
-            Console.WriteLine($"{DateTime.Now:HH:mm fff}\t{msg}");
+        static ClientProxy WaitForNextClient() {
+            TcpClient client = server.AcceptTcpClient();
+            ClientProxy proxy = new ClientProxy(client, ReceiveHandler, ClientDcHandler);
+            clients.Add(proxy);
+            string printed = Print($"{proxy.ShortId}\tNew client!\tTotal: {clients.Count}");
+            PoorMulticast(printed);
+            return proxy;
         }
+
+        static string Print(string msg) {
+            msg = $"{DateTime.Now:HH:mm fff}\t{msg}";
+            Console.WriteLine(msg);
+            return msg;
+        }
+
+        static readonly EventHandler<string> ReceiveHandler = (sender, msg) => {
+            string printed = Print($"{((ClientProxy)sender).ShortId}:\t{msg}");
+            PoorMulticast(printed);
+        };
+
+        static void PoorMulticast(string msg) {
+            foreach (ClientProxy proxy in clients) {
+                proxy.SendAsync(AddHeader(msg));
+            }
+        }
+
+        static string AddHeader(string input) {
+            return $"{(input.Length + 6).ToString().PadLeft(5, '0')}.{input}";
+        }
+
+        static readonly EventHandler<ClientProxy> ClientDcHandler = (sender, msg) => {
+            clients.Remove((ClientProxy)sender);
+            string printed = Print($"{((ClientProxy)sender).ShortId}\tDisconnected.\tTotal: {clients.Count}");
+            PoorMulticast(printed);
+        };
     }
 }
